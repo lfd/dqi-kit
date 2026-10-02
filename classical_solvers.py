@@ -1,9 +1,12 @@
-from ortools.sat.python import cp_model
-import numpy as np
-from sage.all import Matrix, GF, codes, vector, codes
+from __future__ import annotations
+
 import itertools
-from simanneal import Annealer
 import random
+
+import numpy as np
+from ortools.sat.python import cp_model
+from sage.all import vector
+from simanneal import Annealer
 
 
 class AbstractSolver:
@@ -42,7 +45,7 @@ class OrToolsSolver(AbstractSolver):
         n = B.ncols()
         m = B.nrows()
 
-        B = np.array(B)
+        B = np.array(B.list(), dtype=np.int64).reshape(m, n)
 
         model = cp_model.CpModel()
 
@@ -65,7 +68,7 @@ class OrToolsSolver(AbstractSolver):
         if weights is None:
             model.Maximize(sum(satisfied_vars))
         else:
-            model.Maximize(sum([v * w for v, w in zip(satisfied_vars, weights)]))
+            model.Maximize(sum([v * w for v, w in zip(satisfied_vars, weights, strict=False)]))
 
         solver = cp_model.CpSolver()
         if self.time_limit is not None:
@@ -74,15 +77,13 @@ class OrToolsSolver(AbstractSolver):
 
         if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
             self._is_optimal = status == cp_model.OPTIMAL
-            return vector(
-                instance.field, np.array([solver.Value(x[i]) for i in range(n)])
-            )
+            return vector(instance.field, np.array([solver.Value(x[i]) for i in range(n)]))
         else:
             raise ValueError("Could not find a solution")
 
     def is_optimal(self):
         if self._is_optimal is None:
-            self.compute_solution()
+            self.get_solution()
         return self._is_optimal
 
 
@@ -100,13 +101,16 @@ class BruteForceSolver(AbstractSolver):
             if best_solution_value is None or value > best_solution_value:
                 best_solution_value = value
                 best_solution = solution
-        return best_solution
+        return vector(instance.field, best_solution)
 
 
 class MaxLinSatAnneal(Annealer):
     def __init__(self, instance, initial_state=None):
         self.instance = instance
         self.els = list(self.instance.field)
+        self.nonzero_els = [el for el in self.els if el != 0]
+        # no progress printing
+        self.updates = 0
         if initial_state is None:
             initial_state = vector(
                 self.instance.field,
@@ -118,15 +122,11 @@ class MaxLinSatAnneal(Annealer):
         n = self.instance.get_n()
         move = vector(self.instance.field, [0] * n)
         index = random.choice(range(n))
-        el = random.choice(self.els)
-        move[index] = el
+        move[index] = random.choice(self.nonzero_els)
         self.state += move
 
     def energy(self):
         return self.instance.get_m() - self.instance.evaluate_solution(self.state)
-
-    def update(self, *args):
-        pass
 
 
 class SimAnnealSolver(AbstractSolver):
@@ -173,9 +173,7 @@ class PrangeSolver(AbstractSolver):
         n = self.instance.get_n()
         m = self.instance.get_m()
         q = self.instance.field.order()
-        return sum(
-            n / m * 1 + (1 - n / m) * len(F_i) / q for F_i in self.instance.get_F()
-        )
+        return sum(n / m * 1 + (1 - n / m) * len(F_i) / q for F_i in self.instance.get_F())
 
     def compute_solution(self, instance):
         expected_solution_quality = self.get_expected_solution_quality()
@@ -186,7 +184,6 @@ class PrangeSolver(AbstractSolver):
         raise ValueError("Could not find a solution of the expected quality")
 
     def compute_arbitrary_solution(self, instance):
-        n = instance.get_n()
         m = instance.get_m()
         B = instance.get_B()
         F = instance.get_F()
@@ -199,11 +196,7 @@ class PrangeSolver(AbstractSolver):
         pivots = shuffled_B.pivots()
         selected_rows = [perm[i] for i in pivots]
 
-        selected_rows_set = set(selected_rows)
         B_subset = B[selected_rows, :]
-        v_subset = vector(
-            instance.field, [v_i for i, v_i in enumerate(v) if i in selected_rows]
-        )
+        v_subset = vector(instance.field, [v_i for i, v_i in enumerate(v) if i in selected_rows])
 
-        x = B_subset.solve_right(v_subset)
-        return x
+        return B_subset.solve_right(v_subset)

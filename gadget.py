@@ -1,14 +1,14 @@
-from itertools import *
-import warnings
+from __future__ import annotations
+
 import json
 import math
+import warnings
 from collections import defaultdict
-import time
-from typing import Iterable, Callable
+from collections.abc import Callable, Iterable
+from itertools import chain, combinations, product
 
 import numpy as np
-
-from sage.all import Matrix, GF, codes, vector, codes
+from sage.all import GF, Matrix
 from sage.arith.misc import is_prime
 from sage.rings.finite_rings.element_base import FiniteRingElement
 
@@ -18,9 +18,8 @@ def is_valid_first_permutation_key(key: tuple[int, ...]) -> bool:
         if el == 0:
             continue
         return el == 1
-        if el == 1:
-            return True
-        return False
+        return el == 1
+    return None
 
 
 def permutation_orbits(p: int, k: int) -> dict[tuple[int, ...], list[tuple[int, ...]]]:
@@ -43,7 +42,7 @@ def count(p: int, B: np.ndarray, v: np.ndarray, x: np.ndarray) -> int:
 
     tally = 0
 
-    for y_i, v_i in zip(result.reshape(len(B)), v):
+    for y_i, v_i in zip(result.reshape(len(B)), v, strict=False):
         if y_i in v_i:
             tally += 1
 
@@ -58,7 +57,7 @@ def rate_solution(p: int, B: np.ndarray) -> tuple[int, int]:
         for indexes in combinations(range(m), k):
             for values in product(range(1, p), repeat=k):
                 y = np.zeros((1, m))
-                for v, i in zip(values, indexes):
+                for v, i in zip(values, indexes, strict=False):
                     y[0, i] = v
                 if ((y @ B) % p == 0).all():
                     n_dependent = k
@@ -94,7 +93,7 @@ def find_gadget(
     n_aux_vars: int = 0,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     k += n_aux_vars
-    values = list(range(0, p))
+    values = list(range(p))
 
     assert p ** (k - n_aux_vars) == len(results)
 
@@ -110,21 +109,17 @@ def find_gadget(
     for v in all_values:
         symmetry_sets.append([v])
 
-    n = p**k
+    p**k
 
     best_solutions = []
     best_solution_rate = None
 
-    n = p ** len(symmetry_sets)
+    p ** len(symmetry_sets)
 
     orbits = [permutation_orbits(p, len(s)) for s in symmetry_sets]
 
     for temp_B in powerset(
-        (
-            c
-            for c in product(*[orbit.keys() for orbit in orbits])
-            if sum(v for s in c for v in s) > 0
-        )
+        c for c in product(*[orbit.keys() for orbit in orbits]) if sum(v for s in c for v in s) > 0
     ):
         if len(temp_B) == 0:
             continue
@@ -139,17 +134,17 @@ def find_gadget(
             for temp_v in product(*[combinations(range(p), r) for r in rs]):
                 B = []
                 v = []
-                for temp_b_i, v_i in zip(temp_B, temp_v):
+                for temp_b_i, v_i in zip(temp_B, temp_v, strict=False):
                     for perm in product(
                         *[
                             orbit[temp_b_i_part]
-                            for orbit, temp_b_i_part in zip(orbits, temp_b_i)
+                            for orbit, temp_b_i_part in zip(orbits, temp_b_i, strict=False)
                         ]
                     ):
                         v.append(v_i)
                         b_i = [0] * k
-                        for coefs, s in zip(perm, symmetry_sets):
-                            for c, index in zip(coefs, s):
+                        for coefs, s in zip(perm, symmetry_sets, strict=False):
+                            for c, index in zip(coefs, s, strict=False):
                                 b_i[index] = c
                         B.append(b_i)
 
@@ -162,16 +157,11 @@ def find_gadget(
                 no_maximum = None
                 no_minimum = None
 
-                for x, yes in zip(product(values, repeat=k - n_aux_vars), results):
+                for x, yes in zip(product(values, repeat=k - n_aux_vars), results, strict=False):
                     if n_aux_vars == 0:
                         c = count(p, B, v, x)
                     else:
-                        c = max(
-                            (
-                                count(p, B, v, x + x2)
-                                for x2 in product(values, repeat=n_aux_vars)
-                            )
-                        )
+                        c = max(count(p, B, v, x + x2) for x2 in product(values, repeat=n_aux_vars))
 
                     if yes:
                         if yes_minimum is None:
@@ -270,7 +260,7 @@ class Gadget:
         x = np.array(x)
         y = (self.B @ x) % self.p
 
-        return sum(1 if y_i in F_i else 0 for y_i, F_i in zip(y, self.F))
+        return sum(1 if y_i in F_i else 0 for y_i, F_i in zip(y, self.F, strict=False))
 
 
 class GadgetLibrary:
@@ -288,7 +278,7 @@ class GadgetLibrary:
 
     def add_gadget(self, gadget: Gadget):
         if gadget.name in self.gadgets_by_name:
-            warnings.warn(f"Overriding existing gadget {gadget.name}")
+            warnings.warn(f"Overriding existing gadget {gadget.name}", stacklevel=2)
 
         self.gadgets.append(gadget)
         self.gadgets_by_name[gadget.name] = gadget
@@ -359,7 +349,7 @@ class GadgetSpec:
         )
         B, F = gadgets[0]
 
-        gadget = Gadget(
+        return Gadget(
             self.name,
             self.p,
             B,
@@ -370,15 +360,20 @@ class GadgetSpec:
             self.fixed_r,
             self.n_aux_vars,
         )
-        return gadget
 
 
-library = GadgetLibrary("gadget_libaray.json")
+library = GadgetLibrary("gadget_library.json")
 
 gadget_specs = []
 
-and_fn = lambda *args: sum(args) == len(args)
-or_fn = lambda *args: sum(args) >= 1
+
+def and_fn(*args):
+    return sum(args) == len(args)
+
+
+def or_fn(*args):
+    return sum(args) >= 1
+
 
 for k in range(2, 5 + 1):
     symmetry_sets = [list(range(k))]
@@ -415,8 +410,7 @@ if __name__ == "__main__":
             c = (a * b) % p
             B.append([a, b, -1])
             F.append({c})
-            for _c in range(p):
-                truth_table.append(c == _c)
+            truth_table.extend(c == _c for _c in range(p))
 
     gadget = Gadget("test", p, np.array(B), F, truth_table, True, True, True)
     for i, x in enumerate(product(range(p), repeat=3)):

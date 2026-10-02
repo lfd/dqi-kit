@@ -1,12 +1,12 @@
+from __future__ import annotations
+
 import warnings
-from enum import Enum
-import math
-from typing import Callable
+from collections.abc import Callable
 
 from sage.all import GF
 from sage.rings.finite_rings.element_base import FiniteRingElement
 
-LinSatExpr = int | FiniteRingElement | "LinSatVar" | "LinSatTerms"
+type LinSatExpr = int | FiniteRingElement | LinSatVar | LinSatTerms
 
 
 class LinSatVar:
@@ -159,29 +159,26 @@ class LinSatTerms:
 
     def __eq__(self, other: LinSatExpr) -> LinSatConstraint:
         if isinstance(other, set):
-            constraint = self == 0
-            rhs = next(iter(constraint.rhs))
-            new_rhs = {el + rhs for el in other}
-            return LinSatConstraint(
-                constraint.field, constraint.vars, constraint.coefs, new_rhs
-            )
+            terms = self
+            rhs = {self.field(el) for el in other}
+        else:
+            terms = self - LinSatTerms.from_any(self.field, other)
+            rhs = {self.field(0)}
 
-        other = LinSatTerms.from_any(self.field, other)
-        total = self - other
-
-        rhs = self.field(0)
-
+        constant = self.field(0)
         variables = []
         coefs = []
 
-        for key, term in total.terms.items():
+        # remove potential constant term from left-hand side
+        for key, term in terms.terms.items():
             if key is None:
-                rhs = -term.coef
+                constant = term.coef
             else:
                 variables.append(term.var)
                 coefs.append(term.coef)
 
-        return LinSatConstraint(self.field, variables, coefs, {rhs})
+        new_rhs = {el - constant for el in rhs}
+        return LinSatConstraint(self.field, variables, coefs, new_rhs)
 
     def __req__(self, other: LinSatExpr) -> LinSatConstraint:
         return self == other
@@ -224,17 +221,7 @@ class LinSatTerms:
         return self.inequality(other, lambda el: el >= other)
 
     def __str__(self) -> str:
-        return " + ".join((str(t) for t in self.terms.values()))
-
-
-def get_first_coef(variables: list[LinSatVar], coefs: list[FiniteRingElement]):
-    smallest_id = None
-    first_coef = None
-    for v, c in zip(variables, coefs):
-        if smallest_id is None or v.id < smallest_id:
-            smallest_id = v.id
-            first_coef = first_coef
-    return first_coef
+        return " + ".join(str(t) for t in self.terms.values())
 
 
 class LinSatConstraint:
@@ -249,7 +236,7 @@ class LinSatConstraint:
         self.field = field
 
         if isinstance(rhs, set):
-            rhs = {el: 1 for el in rhs}
+            rhs = dict.fromkeys(rhs, 1)
 
         assert len(vars) == len(coefs)
         assert len(rhs) == 0 or n_equations >= max(rhs.values())
@@ -257,18 +244,18 @@ class LinSatConstraint:
 
         self.n_equations = n_equations
 
-        zero_indices = {i for i, c in enumerate(coefs) if c == field(0)}
-        self.vars = [v for i, v in enumerate(vars) if i not in zero_indices]
-        coefs = [field(c) for c in coefs if field(c) != field(0)]
-        rhs = {field(v): weight for v, weight in rhs.items() if weight != 0}
-
-        first_coef = get_first_coef(self.vars, coefs)
-        if first_coef is None:
-            self.coefs = coefs
-            self.rhs = rhs
-        else:
-            self.coefs = [c / first_coef for c in coefs]
-            self.rhs = {c / first_coef: weight for c, weight in rhs.items()}
+        # One entry per variable, no zero coefficients. Scaling and term order
+        # are left as given; get_id() and merge() account for them.
+        by_id = {}
+        for v, c in zip(vars, coefs, strict=False):
+            if v.id in by_id:
+                by_id[v.id] = (v, by_id[v.id][1] + field(c))
+            else:
+                by_id[v.id] = (v, field(c))
+        nonzero = [(v, c) for v, c in by_id.values() if c != field(0)]
+        self.vars = [v for v, _ in nonzero]
+        self.coefs = [c for _, c in nonzero]
+        self.rhs = {field(v): weight for v, weight in rhs.items() if weight != 0}
 
         self.is_degenerate = False
 
@@ -281,24 +268,40 @@ class LinSatConstraint:
 
     def show_degeneracy_warnings(self):
         if len(self.rhs) == 0:
-            warnings.warn(f"Constraint is always false: {self}")
+            warnings.warn(f"Constraint is always false: {self}", stacklevel=2)
         if len(self.rhs) == len(self.field) and len(set(self.rhs.values())) == 1:
-            warnings.warn(f"Constraint is always true: {self}")
+            warnings.warn(f"Constraint is always true: {self}", stacklevel=2)
+
+    def get_first_coef(self) -> FiniteRingElement:
+        """Coefficient of the variable with the smallest id (1 if there are no variables)."""
+        if not self.vars:
+            return self.field(1)
+        return min(zip(self.vars, self.coefs, strict=False), key=lambda p: p[0].id)[1]
 
     def get_id(self) -> tuple[tuple[int, ...], tuple[str, ...]]:
-        return tuple((v.id for v in self.vars)), tuple((str(c) for c in self.coefs))
+        """Equal for constraints on the same linear form up to scaling and term order."""
+        lead = self.get_first_coef()
+        pairs = sorted(zip(self.vars, self.coefs, strict=False), key=lambda p: p[0].id)
+        return tuple(v.id for v, _ in pairs), tuple(str(c / lead) for _, c in pairs)
 
     def merge(self, other: LinSatConstraint) -> LinSatConstraint:
+        """Merge two constraints with equal ids. The result is sorted by variable
+        id and scaled to leading coefficient 1, so it does not depend on the
+        order of the operands."""
         assert self.get_id() == other.get_id()
-        new_rhs = self.rhs.copy()
+        self_lead = self.get_first_coef()
+        other_lead = other.get_first_coef()
+        new_rhs = {el / self_lead: weight for el, weight in self.rhs.items()}
         for el, weight in other.rhs.items():
+            el = el / other_lead
             if el not in new_rhs and weight > 0:
                 new_rhs[el] = 0
             new_rhs[el] += weight
+        pairs = sorted(zip(self.vars, self.coefs, strict=False), key=lambda p: p[0].id)
         return LinSatConstraint(
             self.field,
-            list(self.vars),
-            list(self.coefs),
+            [v for v, _ in pairs],
+            [c / self_lead for _, c in pairs],
             new_rhs,
             self.n_equations + other.n_equations,
         )
@@ -307,7 +310,7 @@ class LinSatConstraint:
         elements = set(self.field)
         new_rhs = {}
         for el in elements:
-            weight = self.rhs[el] if el in self.rhs else 0
+            weight = self.rhs.get(el, 0)
             new_weight = self.n_equations - weight
             if new_weight > 0:
                 new_rhs[el] = new_weight
@@ -317,7 +320,7 @@ class LinSatConstraint:
         )
 
     def scale_weight(self, scalar: int) -> LinSatConstraint:
-        new_rhs = {el: weight * int(scalar) for el, weight in self.rhs.items()}
+        new_rhs = {el: weight * scalar for el, weight in self.rhs.items()}
         return LinSatConstraint(
             self.field, self.vars, self.coefs, new_rhs, self.n_equations * scalar
         )
@@ -332,7 +335,7 @@ class LinSatConstraint:
 
         for weight, rhs in weight_to_rhs.items():
             line = []
-            for c, v in zip(self.coefs, self.vars):
+            for c, v in zip(self.coefs, self.vars, strict=False):
                 line.append(str(c))
                 line.append(str(v))
                 line.append("+")

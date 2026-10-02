@@ -1,33 +1,36 @@
-import math
-import warnings
-import random
-from collections import defaultdict
-from enum import Enum
-import itertools
-from typing import Callable
+from __future__ import annotations
 
+import itertools
+import math
+import random
+import time
+import warnings
+from collections import defaultdict, deque
+from collections.abc import Callable
+from enum import Enum
+
+import ldpc.code_util
+import networkx as nx
 import numpy as np
 import scipy as sp
-import networkx as nx
-from sage.all import Matrix, GF, codes, vector, next_prime, is_prime
-from sage.libs.gap.util import GAPError
-from sage.coding.linear_code import AbstractLinearCode
+from sage.all import GF, Matrix, codes, next_prime, vector
 from sage.coding.grs_code import GeneralizedReedSolomonCode
+from sage.coding.linear_code import AbstractLinearCode
+from sage.libs.gap.util import GAPError
 from sage.rings.finite_rings.element_base import FiniteRingElement
-import ldpc.code_util
 
+from classical_solvers import (
+    BruteForceSolver,
+    OrToolsSolver,
+)
+from constraints import LinSatConstraint, LinSatVar
 from decoders import (
+    DEFAULT_DECODER_CONSTRUCTOR,
     AbstractDecoder,
-    NearestNeighborDecoder,
     BeliefPropagationDecoder,
     GeneralizedReedSolomonDecoder,
     InformationSetDecoder,
-    DEFAULT_DECODER_CONSTRUCTOR
-)
-from constraints import LinSatVar, LinSatConstraint
-from classical_solvers import (
-    OrToolsSolver,
-    BruteForceSolver,
+    NearestNeighborDecoder,
 )
 from gadget import Gadget
 
@@ -45,7 +48,7 @@ class AbstractMaxLinSat:
         self.default_decoder_constructor = default_decoder_constructor
         self.decoder = None
         self.optimal_solution = None
-    
+
     def to_max_linsat(self) -> AbstractMaxLinSat:
         return self
 
@@ -78,17 +81,17 @@ class AbstractMaxLinSat:
         y = B * x
 
         if weights is None:
-            return sum((1 if y_i in F_i else 0 for y_i, F_i in zip(y, F)))
+            return sum((1 if y_i in F_i else 0 for y_i, F_i in zip(y, F, strict=False)))
         else:
             return sum(
-                (w_i if y_i in F_i else 0 for y_i, F_i, w_i in zip(y, F, weights))
+                (w_i if y_i in F_i else 0 for y_i, F_i, w_i in zip(y, F, weights, strict=False))
             )
 
     def get_v(self) -> vector:
         F = self.get_F()
-        if not all((len(f) == 1 for f in self.F)):
+        if not all(len(f) == 1 for f in F):
             raise ValueError("v is not well-defined since not all F_i have a size of 1")
-        return vector(self.field, [next(iter(f)) for f in self.F])
+        return vector(self.field, [next(iter(f)) for f in F])
 
     def get_r(self) -> int:
         F = self.get_F()
@@ -119,7 +122,7 @@ class AbstractMaxLinSat:
         return self.evaluate_solution(self.get_optimal_solution())
 
     def get_random_solution_value(self) -> int:
-        return sum(len(F_i) / len(self.field) for F_i in self.F)
+        return sum(len(F_i) / self.field.order() for F_i in self.get_F())
 
 
 class MergeStrategy(Enum):
@@ -135,6 +138,7 @@ class MaxLinSat(AbstractMaxLinSat):
         field: GF,
         default_decoder_constructor=DEFAULT_DECODER_CONSTRUCTOR,
         merge_strategy=MergeStrategy.DUPLICATES,
+        equal_size_F_i=True,
     ):
         super().__init__(
             field=field,
@@ -149,7 +153,7 @@ class MaxLinSat(AbstractMaxLinSat):
         self.code = None
         self.minimum_distance = None
         self.merge_strategy = merge_strategy
-        self.equal_size_F_i = True
+        self.equal_size_F_i = equal_size_F_i
 
     def clear_cache(self):
         self.B = None
@@ -159,7 +163,7 @@ class MaxLinSat(AbstractMaxLinSat):
         self.minimum_distance = None
         self.optimal_solution = None
 
-    def new_var(self, name: str | None = None) -> LinSatVar:
+    def new_var(self, name: str) -> LinSatVar:
         var = LinSatVar(self.field, len(self.variables), name)
         self.variables.append(var)
         self.clear_cache()
@@ -174,13 +178,16 @@ class MaxLinSat(AbstractMaxLinSat):
         if constraint.field != self.field:
             raise ValueError("Field mismatch", self.field, constraint.field)
         for var in constraint.vars:
-            if var.id not in self.variables or var.name != self.variables[var.id].name:
+            # check if variable exists by identity ("is") since == ("__eq__") is overloaded
+            if not (0 <= var.id < len(self.variables)) or self.variables[var.id] is not var:
                 raise ValueError("Unknown variable", var)
 
         if not disable_warnings:
             constraint.show_degeneracy_warnings()
 
         if weight is not None:
+            if not isinstance(weight, int):
+                raise TypeError(f"Max-LINSAT weights must be integers, got {weight!r}")
             constraint = constraint.scale_weight(weight)
 
         cid = constraint.get_id()
@@ -191,7 +198,7 @@ class MaxLinSat(AbstractMaxLinSat):
         self.clear_cache()
 
     def add_gadget(self, gadget: Gadget, *variables: LinSatVar):
-        for b_i, F_i in zip(gadget.B, gadget.F):
+        for b_i, F_i in zip(gadget.B, gadget.F, strict=False):
             self.add_constraint(LinSatConstraint(self.field, variables, b_i, F_i))
 
     def set_equal_size_F_i(self, value):
@@ -201,15 +208,12 @@ class MaxLinSat(AbstractMaxLinSat):
         constraints = [c for c in self.constraints.values() if not c.is_degenerate]
         constraints.sort(key=lambda c: c.get_id())
 
+        # compute common factor to divide the weights
+        # Since degenerate constraints have been filtered out above, gcd will be >= 1
         gcd = 0
         for c in constraints:
             for weight in c.rhs.values():
                 gcd = math.gcd(gcd, weight)
-
-        if gcd != 0:
-            for c in constraints:
-                for el, weight in c.rhs.items():
-                    c.rhs[el] = weight // gcd
 
         used_variables = set()
 
@@ -218,17 +222,20 @@ class MaxLinSat(AbstractMaxLinSat):
         weights = []
         for constraint in constraints:
             row = [self.field(0)] * len(self.variables)
-            for coef, var in zip(constraint.coefs, constraint.vars):
+            for coef, var in zip(constraint.coefs, constraint.vars, strict=False):
                 row[var.id] += coef
                 used_variables.add(var.id)
 
             rhs_by_weight = {}
             for el, weight in constraint.rhs.items():
+                weight //= gcd
                 if weight not in rhs_by_weight:
                     rhs_by_weight[weight] = set()
                 rhs_by_weight[weight].add(el)
 
-            if len(rhs_by_weight) == len(self.field):
+            # If the RHS contains all elements, we can subtract the smallest achievable
+            # weight (constant offset) and remove the respective elements from the rhs
+            if len(constraint.rhs) == len(self.field):
                 minimum = min(rhs_by_weight.keys())
                 new_rhs_by_weight = {}
                 for weight, values in rhs_by_weight.items():
@@ -237,7 +244,7 @@ class MaxLinSat(AbstractMaxLinSat):
                     new_rhs_by_weight[weight - minimum] = values
                 rhs_by_weight = new_rhs_by_weight
 
-            sorted_weights = sorted(list(rhs_by_weight.keys()))
+            sorted_weights = sorted(rhs_by_weight.keys())
 
             if self.merge_strategy == MergeStrategy.WEIGHTS:
                 for weight, rhs in rhs_by_weight.items():
@@ -259,7 +266,7 @@ class MaxLinSat(AbstractMaxLinSat):
                 B_rows.append(row)
                 F.append(rhs)
             elif self.merge_strategy == MergeStrategy.USE_LOOSEST:
-                total_rhs = {}
+                total_rhs = set()
                 for rhs in rhs_by_weight.values():
                     total_rhs.update(rhs)
                 B_rows.append(row)
@@ -278,7 +285,7 @@ class MaxLinSat(AbstractMaxLinSat):
             weights = weights if len(weights) > 0 else [None] * len(B_rows)
 
             assert len(B_rows) == len(F) == len(weights)
-            for B_row, F_i, weight in zip(B_rows, F, weights):
+            for B_row, F_i, weight in zip(B_rows, F, weights, strict=False):
                 F_i_els = list(F_i)
                 for i in range(0, len(F_i_els), gcd):
                     new_B_rows.append(B_row)
@@ -294,17 +301,15 @@ class MaxLinSat(AbstractMaxLinSat):
         self.weights = weights
 
         if len(used_variables) != len(self.variables):
-            unused_variables = []
-            for var in self.variables:
-                if var.id not in used_variables:
-                    unused_variables.append(var)
+            unused_variables = [var for var in self.variables if var.id not in used_variables]
             warnings.warn(
-                f"Unused variables: {", ".join([var.name for var in unused_variables])}"
+                f"Unused variables: {', '.join([var.name for var in unused_variables])}",
+                stacklevel=2,
             )
 
         if self.B.nrows() <= self.B.ncols():
             warnings.warn(
-                "Max-LINSAT instance should have more constraints than variables"
+                "Max-LINSAT instance should have more constraints than variables", stacklevel=2
             )
 
     def compute_code(self):
@@ -332,42 +337,183 @@ class MaxLinSat(AbstractMaxLinSat):
             self.compute_code()
         return self.code
 
+    # estimates minimum distance via a graph traversal
+    # returns a tuple with the estimate and a Boolean describing whether its exact or only an upper bound
+    def _compute_graph_minimum_distance(self):
+        B = self.get_B()
+
+        # singles: constraints with only 1 variable
+        singles = []
+        # doubles: constraints with exactly 2 variables, as (u, v, coefficient
+        # of u, coefficient of v)
+        doubles = []
+
+        # if the instance contains only singles and doubles, this method returns the exact minimum distance
+        # otherwise the result will be an upper bound on the minimum distance
+        only_singles_and_doubles = True
+
+        for row in B.rows():
+            non_zero = [j for j, x in enumerate(row) if x != 0]
+            if len(non_zero) == 1:
+                singles.append(non_zero[0])
+            elif len(non_zero) == 2:
+                u, v = non_zero
+                doubles.append((u, v, row[u], row[v]))
+            else:
+                only_singles_and_doubles = False
+
+        # Globally rescaling variables does not change linear dependencies!
+        # Proof:
+        # In a set of lineraly dependend rows of B, the coefficients (say b_1, ..., b_k) for every
+        # variable x_i sum up to zero.
+        # If we subsitute x_i = s_i y_i for some scalar s_i and rescaled variable y_i,
+        # the coefficients still sum up to zero since b_1 s_i + ... b_k s_i = s_i (b_1 + ... + b_k)
+        #
+        # We can use this to look for linear dependencies.
+        #
+        # The idea of the following algorithm:
+        # for any non-zero scalars c_i, the cycle
+        # c_1 (x_1 - x_2), c_2 (x_2 - x_3), ..., c_k (x_k - x_1) is a linear dependency.
+        # We try to rescale variables by substituting x_i = s_i y_i (s_i is a scalar, y_i a var.)
+        # in order to reach this form.
+        # For some constraint a x_i + b x_j,
+        # a x_i + b x_j = a s_i y_i + b s_j y_j = c (y_i - y_j)
+        # if and only if a s_i = c and b s_j = -c or, equivalently,
+        # a s_i + b s_j = 0 <=> s_j = - a s_i / b
+        #
+        # For every connected component of the graph, we arbitrarily pick some variable y_0 (or x_0)
+        # and set s_0 = 1.
+        # We then run a BFS. When traversing (y_i, y_j) from i to j,
+        # we set s_j = - a s_i / b
+        #
+        # Finally, we look at all edges again and drop all that do not satisfy a s_i + b s_j = 0
+        # Cycles and paths between "singles" on the resulting graph are then guaranteed to represent
+        # linear dependencies.
+        # If the graph contains all edges, all linear dependencies of degree-2 constraints are found
+        # Otherwise, when some were dropped, this is only an upper bound since some shorter cycles
+        # might have been missed.
+        adjacency = defaultdict(list)
+        for u, v, a, b in doubles:
+            adjacency[u].append((v, a, b))
+            adjacency[v].append((u, b, a))
+        scale = {}
+        for root in range(B.ncols()):
+            if root in scale:
+                continue
+            scale[root] = self.field.one()
+            queue = deque([root])
+            while queue:
+                u = queue.popleft()
+                for v, a, b in adjacency[u]:
+                    if v not in scale:
+                        scale[v] = -a * scale[u] / b
+                        queue.append(v)
+
+        graph = nx.Graph()
+        graph.add_nodes_from(list(range(B.ncols())))
+        dropped = []
+        for u, v, a, b in doubles:
+            if a * scale[u] + b * scale[v] != 0:
+                dropped.append((u, v))
+            else:
+                graph.add_edge(u, v)
+
+        # girth: length of shortest cycle
+        girth = nx.girth(graph)
+
+        # A path between two singles is always a linear dependency since at any edge and the final
+        # vertex, we can always select the scaling to cancel out the previous term
+        graph.add_edges_from(dropped)
+        shortest_distance = math.inf
+        for i, u in enumerate(singles):
+            distances = nx.single_source_shortest_path_length(graph, u)
+            for j in range(i + 1, len(singles)):
+                v = singles[j]
+                if v in distances and distances[v] < shortest_distance:
+                    shortest_distance = distances[v]
+
+        # a cycle or a path with two endpoints is a linear dependency (thus + 2)
+        return (
+            min(girth, shortest_distance + 2),
+            only_singles_and_doubles and len(dropped) == 0,
+        )
+
+    def _compute_minimum_distance_from_singles(self):
+        B = self.get_B()
+        singles = set()
+
+        for row in B.rows():
+            non_zero = [j for j, x in enumerate(row) if x != 0]
+            if len(non_zero) == 1:
+                singles.add(non_zero[0])
+
+        smallest_combination = math.inf
+        for row in B.rows():
+            non_zero = [j for j, x in enumerate(row) if x != 0]
+            if len(non_zero) == 1:
+                continue
+            if all(x in singles for x in non_zero):
+                smallest_combination = min(smallest_combination, len(non_zero))
+        return smallest_combination + 1
+
     def compute_minimum_distance(self, approximate=True):
+        B = self.get_B()
+
+        if B.T.right_kernel().dimension() == 0:
+            return 0
+
+        rows = list(B.rows())
+        # check for duplicate rows, which automatically lead to minimum distance 2
+        if len(set(rows)) < len(rows):
+            return 2
+
+        result_graph, is_exact = self._compute_graph_minimum_distance()
+        if result_graph == 3 or is_exact:
+            return result_graph
+
+        result_singles = self._compute_minimum_distance_from_singles()
+        if result_singles == 3:
+            return result_singles
+
         if self.field.order() == 2:
-            B = self.get_B()
-            if B.T.kernel().dimension() == 0:
-                self.minimum_distance = 0
-                return
-            B = np.array(self.get_B().T).astype(np.int8)
+            BT = self.get_B().T
+            B = np.array(BT.list(), dtype=np.int8).reshape(BT.nrows(), BT.ncols())
             H = sp.sparse.csc_matrix(B)
             if approximate:
-                self.minimum_distance = ldpc.code_util.estimate_code_distance(H)[0]
+                return ldpc.code_util.estimate_code_distance(H)[0]
             else:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     try:
-                        self.minimum_distance = (
-                            ldpc.code_util.compute_exact_code_distance(H)
-                        )
+                        return ldpc.code_util.compute_exact_code_distance(H)
                     except ValueError:
-                        self.minimum_distance = 0
+                        return 0
         else:
             code = self.get_code()
+            if approximate:
+                start = time.time()
+                duration = 5
+
+                smallest_weight = math.inf
+                while time.time() < start + duration:
+                    prob = random.random()
+                    codeword = code.random_element(prob=prob)
+                    weight = codeword.hamming_weight()
+                    if weight == 0:
+                        continue
+                    smallest_weight = min(smallest_weight, weight)
+
+                return min(smallest_weight, result_graph, result_singles)
+
             try:
-                self.minimum_distance = code.minimum_distance("guava")
+                return code.minimum_distance("guava")
             except GAPError:
-                self.minimum_distance = 0
+                return 0
 
     def get_minimum_distance(self) -> int:
         if self.minimum_distance is None:
-            self.compute_minimum_distance()
+            self.minimum_distance = self.compute_minimum_distance()
         return self.minimum_distance
-    
-    def get_decoding_radius(self) -> int:
-        if self.minimum_distance is None:
-            self.compute_minimum_distance()
-            return (self.minimum_distance - 1) // 2
-        
 
     def __str__(self) -> str:
         return f"Max-LINSAT instance over {self.field} with {len(self.variables)} varaiables and {len(self.constraints)} constraints"
@@ -417,7 +563,7 @@ class BinaryPaintshop(MaxLinSat):
             if value not in variables:
                 variables[value] = self.new_var(f"x_{value}")
 
-        indexes = defaultdict(lambda: [])
+        indexes = defaultdict(list)
         for i, v in enumerate(jobs):
             indexes[v].append(i)
 
@@ -432,14 +578,14 @@ class BinaryPaintshop(MaxLinSat):
                 return 1 - variables[value]
             raise ValueError("Unreachable")
 
-        for i, (a, b) in enumerate(zip(jobs, jobs[1:])):
+        for i, (_a, _b) in enumerate(itertools.pairwise(jobs)):
             color_a = get_color_for_index(i)
             color_b = get_color_for_index(i + 1)
             self.add_constraint(color_a == color_b)
 
 
 def get_next_free_vertex(graph: nx.Graph) -> int:
-    return max((u if isinstance(u, int) else -1 for u in graph)) + 1
+    return max(u if isinstance(u, int) else -1 for u in graph) + 1
 
 
 def prepare_hamiltonian_cycle_graph(graph: nx.Graph, seed: int) -> nx.Graph:
@@ -494,9 +640,7 @@ class HamiltonianCycle(MaxLinSat):
         random_seed=0,
     ):
         graph = prepare_hamiltonian_cycle_graph(graph, random_seed)
-        super().__init__(
-            GF(len(graph)), decoder_constructor, MergeStrategy.USE_STRICTEST
-        )
+        super().__init__(GF(len(graph)), decoder_constructor, MergeStrategy.USE_STRICTEST)
 
         self.graph = graph
 
@@ -511,7 +655,7 @@ class HamiltonianCycle(MaxLinSat):
 
     def solution_vector_to_path(self, solution_vector: vector):
         var_to_pos = {}
-        for var, pos in zip(self.variables, solution_vector):
+        for var, pos in zip(self.variables, solution_vector, strict=False):
             var_to_pos[var.name] = int(pos)
 
         pos_to_vertex = {0: self.first_vertex}
@@ -537,7 +681,7 @@ class UnweightedIsing(MaxLinSat):
         default_decoder_constructor=BeliefPropagationDecoder.constructor(),
     ):
         super().__init__(GF(2), default_decoder_constructor)
-        assert len(self.J) == len(self.J[0]) == len(h)
+        assert len(J) == len(J[0]) == len(h)
 
         n = len(h)
 
@@ -613,6 +757,9 @@ class OptimalPolynomialIntersection(AbstractMaxLinSat):
 
     def get_F(self) -> list[set[FiniteRingElement]]:
         return self.F
+
+    def get_code(self) -> AbstractLinearCode:
+        return self.dual_code
 
     def get_minimum_distance(self) -> int:
         return self.dual_code.minimum_distance()

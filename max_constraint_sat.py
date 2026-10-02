@@ -1,17 +1,18 @@
-import warnings
-from enum import Enum
-import math
-from fractions import Fraction
+from __future__ import annotations
+
 import itertools
-from typing import Callable
+import math
+from collections.abc import Callable
+from enum import Enum
+from fractions import Fraction
 
-from sage.all import GF, next_prime, is_prime
+from sage.all import GF, is_prime, next_prime
 
-from constraints import LinSatConstraint, LinSatVar, LinSatTerms, LinSatTerm
+from constraints import LinSatConstraint, LinSatTerm, LinSatTerms, LinSatVar
+from decoders import DEFAULT_DECODER_CONSTRUCTOR
 from max_lin_sat import MaxLinSat, MergeStrategy
-from decoders import NearestNeighborDecoder, DEFAULT_DECODER_CONSTRUCTOR
 
-IntExpr = int | Fraction | "IntVar" | "IntTerms"
+type IntExpr = int | Fraction | IntVar | IntTerms
 
 
 class Relation(Enum):
@@ -49,7 +50,7 @@ class IntConstraint:
         self.terms = terms
         self.relation = relation
         self.mod = mod
-        self.required_field_order = None
+        self.required_field_order = required_field_order
         if self.required_field_order is None:
             self.required_field_order = self.compute_required_field_order()
         self.weight = Fraction(weight)
@@ -65,9 +66,7 @@ class IntConstraint:
         return self.with_mod(p)
 
     def with_weight(self, weight: Fraction) -> IntConstraint:
-        return IntConstraint(
-            self.terms, self.relation, self.mod, self.required_field_order, weight
-        )
+        return IntConstraint(self.terms, self.relation, self.mod, self.required_field_order, weight)
 
     def compute_required_field_order(self) -> tuple[int | None, int]:
         lcm = self.terms.compute_lcm()
@@ -153,21 +152,15 @@ class IntConstraint:
         self, field: GF, var_mapping: dict[int, LinSatVar]
     ) -> LinSatConstraint:
         if self.get_degree() > 1:
-            raise ValueError(
-                f"to_lin_sat_constraint does not support non-linear constraint {self}"
-            )
+            raise ValueError(f"to_lin_sat_constraint does not support non-linear constraint {self}")
         if self.terms.compute_lcm() != 1:
-            raise ValueError(
-                f"to_lin_constraint does not support non-integer coefficients: {self}"
-            )
-
-        p = field.order()
+            raise ValueError(f"to_lin_constraint does not support non-integer coefficients: {self}")
 
         degenerate_value = self.get_degenerate_value()
 
-        if degenerate_value == True:
+        if degenerate_value is True:
             return LinSatTerms.from_term_list(field, []) == 0
-        elif degenerate_value == False:
+        elif degenerate_value is False:
             return LinSatTerms.from_term_list(field, []) == 1
 
         l, u = self.terms.get_lower_upper_bounds()
@@ -190,11 +183,11 @@ class IntConstraint:
             elif self.relation == Relation.DOES_NOT_EQUAL:
                 return terms != 0
             elif self.relation == Relation.GREATER_THAN:
-                return terms == set(range(1, u))
+                return terms == set(range(1, u + 1))
             elif self.relation == Relation.LESS_THAN:
                 return terms == set(range(l, 0))
             elif self.relation == Relation.GREATER_THAN_OR_EQUALS:
-                return terms == set(range(0, u))
+                return terms == set(range(u + 1))
             elif self.relation == Relation.LESS_THAN_OR_EQUALS:
                 return terms == set(range(l, 1))
             else:
@@ -205,15 +198,13 @@ class IntConstraint:
             invert = self.relation == Relation.DOES_NOT_EQUAL
             for value in range(l, u + 1):
                 match = value % self.mod == 0
-                if match and not invert or not match and invert:
+                if (match and not invert) or (not match and invert):
                     rhs.add(value)
             return terms == rhs
 
 
 class IntVar:
-    def __init__(
-        self, var_id: int, name: str | None = None, lower: int = 0, upper: int = 1
-    ):
+    def __init__(self, var_id: int, name: str | None = None, lower: int = 0, upper: int = 1):
         self.id = var_id
         self.name = name
         self.lower = lower
@@ -296,11 +287,7 @@ class IntTerms:
     def from_any(other: IntTerms | int | Fraction | IntVar) -> IntTerms:
         if isinstance(other, IntTerms):
             return other
-        if (
-            isinstance(other, int)
-            or isinstance(other, float)
-            or isinstance(other, Fraction)
-        ):
+        if isinstance(other, (int, float, Fraction)):
             return IntTerms.from_scalar(other)
         if isinstance(other, IntVar):
             return IntTerms.from_var(other)
@@ -327,15 +314,11 @@ class IntTerms:
         return tuple(result)
 
     @staticmethod
-    def merge_variables(
-        a: dict[int, IntVar], b: dict[int, IntVar]
-    ) -> dict[int, IntVar]:
+    def merge_variables(a: dict[int, IntVar], b: dict[int, IntVar]) -> dict[int, IntVar]:
         variables = a.copy()
         for var_id, var in b.items():
             if var_id in variables and variables[var_id] is not var:
-                raise ValueError(
-                    f"Variable mismatch for ID {var_id}: {variables[var_id]} != {var}"
-                )
+                raise ValueError(f"Variable mismatch for ID {var_id}: {variables[var_id]} != {var}")
             variables[var_id] = var
         return variables
 
@@ -358,12 +341,8 @@ class IntTerms:
             for var, e in variables:
                 l = self.variables[var].lower ** e
                 u = self.variables[var].upper ** e
-                new_term_min = min(
-                    term_min * l, term_min * u, term_max * l, term_max * u
-                )
-                new_term_max = max(
-                    term_min * l, term_min * u, term_max * l, term_max * u
-                )
+                new_term_min = min(term_min * l, term_min * u, term_max * l, term_max * u)
+                new_term_max = max(term_min * l, term_min * u, term_max * l, term_max * u)
                 term_min = new_term_min
                 term_max = new_term_max
             lower_bound += term_min
@@ -389,16 +368,16 @@ class IntTerms:
         return IntTerms(variables, terms)
 
     def scale(self, scalar: Fraction | int) -> IntTerms:
-        if not (isinstance(scalar, int) or isinstance(scalar, Fraction)):
-            raise ValueError(f'{scalar} must be of type "int" or "Fraction"')
+        if not isinstance(scalar, (int, Fraction)):
+            raise TypeError(f'{scalar} must be of type "int" or "Fraction"')
         if scalar == 0:
             return IntTerms({}, {})
         terms = {term: coef * scalar for term, coef in self.terms.items()}
         return IntTerms(self.variables, terms)
 
     def scalar_div(self, scalar: Fraction | int) -> IntTerms:
-        if not (isinstance(scalar, int) or isinstance(scalar, Fraction)):
-            raise ValueError(f'{scalar} must be of type "int" or "Fraction"')
+        if not isinstance(scalar, (int, Fraction)):
+            raise TypeError(f'{scalar} must be of type "int" or "Fraction"')
         if scalar == 0:
             return IntTerms({}, {})
         terms = {term: coef / scalar for term, coef in self.terms.items()}
@@ -418,9 +397,7 @@ class IntTerms:
 
         return IntTerms(variables, terms)
 
-    def to_constraint(
-        self, other: int | IntVar | IntTerms, relation: Relation
-    ) -> IntConstraint:
+    def to_constraint(self, other: int | IntVar | IntTerms, relation: Relation) -> IntConstraint:
         other = IntTerms.from_any(other)
         new_terms = self - other
         return IntConstraint(new_terms, relation)
@@ -440,9 +417,7 @@ class IntTerms:
             return self.to_ising()
         if self.get_degree() <= 1:
             return self.to_non_binary_linearized_constraint()
-        raise ValueError(
-            f"Non-binary higher-order objective cannot be linearized: {self}"
-        )
+        raise ValueError(f"Non-binary higher-order objective cannot be linearized: {self}")
 
     def to_non_binary_linearized_constraint(self) -> list[IntConstraint]:
         constraints = []
@@ -453,9 +428,7 @@ class IntTerms:
                 constant_offset += c
                 continue
             if len(term) > 1 or term[0][1] != 1:
-                raise ValueError(
-                    f"Non-binary higher-order objective cannot be linearized: {self}"
-                )
+                raise ValueError(f"Non-binary higher-order objective cannot be linearized: {self}")
             variable = self.variables[term[0][0]]
 
             if c > 0:
@@ -471,9 +444,7 @@ class IntTerms:
                 if weight != 0:
                     constraints.append((variable == num).with_weight(weight))
 
-        constraints.append(
-            IntConstraint(IntTerms({}, {}), Relation.EQUALS, weight=constant_offset)
-        )
+        constraints.append(IntConstraint(IntTerms({}, {}), Relation.EQUALS, weight=constant_offset))
 
         return constraints
 
@@ -483,12 +454,10 @@ class IntTerms:
 
         ising = {}
 
-        offset = 0
-
         for term, c in self.terms.items():
-            variables = list((v for v, _ in term))
+            variables = [v for v, _ in term]
             factor = Fraction(c, 2 ** len(variables))
-            for k in range(0, len(variables) + 1):
+            for k in range(len(variables) + 1):
                 sign = 1 if k % 2 == 0 else -1
                 coef = factor * sign
                 for comb in itertools.combinations(variables, k):
@@ -497,18 +466,14 @@ class IntTerms:
                     ising[comb] += coef
 
         if () in ising:
-            ising[()] -= sum(
-                (abs(c) if c != 0 and term != () else 0 for term, c in ising.items())
-            )
+            ising[()] -= sum((abs(c) if c != 0 and term != () else 0 for term, c in ising.items()))
 
         constraints = []
         for term, c in ising.items():
             if c == 0:
                 continue
             if term == ():
-                constraints.append(
-                    IntConstraint(IntTerms({}, {}), Relation.EQUALS, weight=c)
-                )
+                constraints.append(IntConstraint(IntTerms({}, {}), Relation.EQUALS, weight=c))
                 continue
 
             variables = {i: self.variables[i] for i in term}
@@ -517,9 +482,7 @@ class IntTerms:
                 terms[()] = 1
 
             int_terms = IntTerms(variables, terms)
-            constraints.append(
-                IntConstraint(int_terms, Relation.EQUALS, mod=2, weight=2 * abs(c))
-            )
+            constraints.append(IntConstraint(int_terms, Relation.EQUALS, mod=2, weight=2 * abs(c)))
         return constraints
 
     def reduce_degree(
@@ -561,8 +524,7 @@ class IntTerms:
 
             new_terms[term_id] = coef
 
-        result = IntTerms(new_vars, new_terms)
-        return result
+        return IntTerms(new_vars, new_terms)
 
     def linearize(
         self, get_temp_var: Callable[[tuple[int, ...]], IntVar], max_degree: int
@@ -709,19 +671,16 @@ class MaxConstraintSat:
             constraint = constraint.with_weight(weight)
         self.constraints.append(constraint)
 
-    def add_objective(
-        self, terms: IntTerms, minimize: bool = False, weight: Fraction | int = 1
-    ):
+    def add_objective(self, terms: IntTerms, minimize: bool = False, weight: Fraction | int = 1):
         factor = weight
         if minimize:
             factor *= -1
-        if factor != 1:
-            terms = terms * weight
+        terms = terms * factor
 
         self.objectives.append(terms)
 
     def add_boolean_constraint(self, terms: IntTerms, weight: Fraction | int = 1):
-        self.add_objective(terms, weight)
+        self.add_objective(terms, weight=weight)
 
     def add_boolean_equality(
         self,
@@ -748,9 +707,7 @@ class MaxConstraintSat:
         if self.linearized_equality_constraints is None:
             self.linearized_equality_constraints = []
             for constraint in self.equality_constraints:
-                self.linearized_equality_constraints.extend(
-                    constraint.to_linearized_constraint()
-                )
+                self.linearized_equality_constraints.extend(constraint.to_linearized_constraint())
         return self.linearized_equality_constraints
 
     def compute_field_order(self) -> int:
@@ -857,13 +814,9 @@ class MaxConstraintSat:
         equality_constraint_factor: int = 2,
         default_decoder_constructor=DEFAULT_DECODER_CONSTRUCTOR,
         merge_strategy: MergeStrategy = MergeStrategy.DUPLICATES,
+        equal_size_F_i: bool = True,
     ) -> MaxLinSat:
-        if (
-            len(self.constraints)
-            + len(self.equality_constraints)
-            + len(self.objectives)
-            == 0
-        ):
+        if len(self.constraints) + len(self.equality_constraints) + len(self.objectives) == 0:
             raise ValueError("Cannot convert empty MaxConstraintSat instance")
         if self.get_constraint_degree() > 1 or self.get_objective_degree() > max_degree:
             return self.reduce_constraint_degrees(max_degree).to_max_linsat(
@@ -872,18 +825,23 @@ class MaxConstraintSat:
                 equality_constraint_factor=equality_constraint_factor,
                 default_decoder_constructor=default_decoder_constructor,
                 merge_strategy=merge_strategy,
+                equal_size_F_i=equal_size_F_i,
             )
         field = GF(self.compute_field_order())
-        max_lin_sat = MaxLinSat(field, default_decoder_constructor, merge_strategy)
+        max_lin_sat = MaxLinSat(
+            field=field,
+            default_decoder_constructor=default_decoder_constructor,
+            merge_strategy=merge_strategy,
+            equal_size_F_i=equal_size_F_i,
+        )
         var_map = {}
 
         lcm = self.compute_weight_lcm()
-        total_weight = (
-            len(self.objectives) + sum(c.weight for c in self.constraints) * lcm
-        )
+        total_weight = len(self.objectives) + sum(c.weight for c in self.constraints) * lcm
 
-        var_range_weight = total_weight * var_range_constraint_factor
-        equality_constraint_weight = total_weight * equality_constraint_factor
+        # total_weight is an integer
+        var_range_weight = int(total_weight * var_range_constraint_factor)
+        equality_constraint_weight = int(total_weight * equality_constraint_factor)
 
         for variable in self.variables:
             lin_sat_var = max_lin_sat.new_var(variable.name)
@@ -895,9 +853,7 @@ class MaxConstraintSat:
             )
 
         for constraint in self.get_linearized_equality_constraints():
-            linsat_constraint = constraint.integerize().to_lin_sat_constraint(
-                field, var_map
-            )
+            linsat_constraint = constraint.integerize().to_lin_sat_constraint(field, var_map)
             max_lin_sat.add_constraint(
                 linsat_constraint,
                 weight=equality_constraint_weight,
@@ -916,6 +872,6 @@ class MaxConstraintSat:
                 )
             max_lin_sat.add_constraint(
                 constraint.integerize().to_lin_sat_constraint(field, var_map),
-                weight=constraint.weight * lcm,
+                weight=int(constraint.weight * lcm),
             )
         return max_lin_sat

@@ -1,13 +1,14 @@
+from __future__ import annotations
+
 import random
 
 import networkx as nx
 from sage.all import GF
 
-from max_constraint_sat import MaxConstraintSat
-from max_lin_sat import MaxLinSat
-
 from classical_solvers import SimAnnealSolver
 from dqi import Dqi
+from max_constraint_sat import MaxConstraintSat
+from max_lin_sat import MaxLinSat
 
 
 # Knapsack
@@ -25,10 +26,10 @@ W = sum(item.weight for item in items) // 2
 knapsack = MaxConstraintSat()
 x = [knapsack.new_binary_var(f"x_{i}") for i in range(len(items))]
 knapsack.add_constraint(
-    sum(x_i * i.weight for x_i, i in zip(x, items)) <= W,
+    sum(x_i * i.weight for x_i, i in zip(x, items, strict=False)) <= W,
     weight=2 * sum(i.value for i in items),
 )
-knapsack.add_objective(sum(x_i * i.value for x_i, i in zip(x, items)))
+knapsack.add_objective(sum(x_i * i.value for x_i, i in zip(x, items, strict=False)))
 
 
 # Minimum vertex cover

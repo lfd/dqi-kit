@@ -1,20 +1,27 @@
 from __future__ import annotations
-import math
-import itertools
-import random
-from typing import Iterator, Callable
 
-import scipy as sp
+import itertools
+import math
+import random
+from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING
+
 import numpy as np
+import scipy as sp
 from ldpc import BpDecoder, BpOsdDecoder
-from sage.all import Matrix, GF, codes, vector, codes
+from sage.all import GF, vector
+from sage.coding.decoder import DecodingError
+from sage.coding.grs_code import GeneralizedReedSolomonCode, GRSBerlekampWelchDecoder
+from sage.coding.guruswami_sudan.gs_decoder import GRSGuruswamiSudanDecoder
+from sage.coding.information_set_decoder import LinearCodeInformationSetDecoder
 from sage.coding.linear_code import (
     LinearCodeNearestNeighborDecoder,
     LinearCodeSyndromeDecoder,
 )
-from sage.coding.information_set_decoder import LinearCodeInformationSetDecoder
-from sage.coding.grs_code import GRSBerlekampWelchDecoder
-from sage.coding.guruswami_sudan.gs_decoder import GRSGuruswamiSudanDecoder
+from sage.misc.randstate import randstate
+
+if TYPE_CHECKING:
+    from max_lin_sat import MaxLinSat
 
 
 class BenchmarkResult:
@@ -36,9 +43,7 @@ class BenchmarkResult:
 def generate_all_errors(field: GF, n: int, k: int) -> Iterator[vector]:
     els = [e for e in field if e != 0]
 
-    for error_indices in (
-        np.array(comb) for comb in itertools.combinations(range(n), k)
-    ):
+    for error_indices in (np.array(comb) for comb in itertools.combinations(range(n), k)):
         for error_digits in itertools.product(els, repeat=k):
             e = vector(field, [0] * n)
             for i, idx in enumerate(error_indices):
@@ -55,7 +60,7 @@ def generate_errors(field: GF, n: int, k: int, n_tries: int | None) -> Iterator[
             yield e
 
     elif 2 * n_tries >= n_possible_errors:
-        all_errors = [e for e in generate_all_errors(field, n, k)]
+        all_errors = list(generate_all_errors(field, n, k))
         random.shuffle(all_errors)
         for i in range(n_tries):
             yield all_errors[i]
@@ -76,43 +81,146 @@ def generate_errors(field: GF, n: int, k: int, n_tries: int | None) -> Iterator[
 
 
 class AbstractDecoder:
-    def __init__(self, instance: "MaxLinSat"):
+    """Base class of all decoders.
+
+    A subclass implements *exactly one* of the two decoding interfaces:
+
+    * ``decode_syndrome(s, l)`` -- the natural interface for DQI: the decoder
+      only sees the syndrome ``s = H e`` (with ``H = B^T`` the parity check
+      matrix of the DQI code ``ker(B^T)``) and returns an error estimate of
+      length ``m``, or ``None`` if decoding fails.
+    * ``decode_codeword(y, l)`` -- the classical word based interface: given a
+      received word ``y`` of length ``m`` return the nearest codeword.
+
+    Word based decoders are turned into syndrome decoders by
+    :meth:`error_estimate` via a fixed coset representative ``rho(s)`` with
+    ``H rho(s) = s``: the estimate is ``rho - decode_codeword(rho)``.  This is
+    what the DQI circuit does, and in particular it returns exactly one error
+    per syndrome (a word based decoder fed the error itself breaks ties per
+    word and would report several errors of the same coset as correct).
+    """
+
+    def __init__(self, instance: MaxLinSat):
         self.instance = instance
         self.benchmarks = {}
+
+        cls = type(self)
+        has_syndrome = cls.decode_syndrome is not AbstractDecoder.decode_syndrome
+        has_codeword = cls.decode_codeword is not AbstractDecoder.decode_codeword
+        if has_syndrome and has_codeword:
+            raise TypeError(
+                f"{cls.__name__} overrides both decode_syndrome and decode_codeword; "
+                "a decoder must implement exactly one of them"
+            )
+        if not has_syndrome and not has_codeword:
+            raise TypeError(
+                f"{cls.__name__} implements neither decode_syndrome nor decode_codeword; "
+                "a decoder must implement exactly one of them"
+            )
+        self.decodes_syndromes = has_syndrome
+
+        # H = B^T is the parity check matrix of the code ker(B^T) used by DQI.
+        self.H = self.instance.get_B().T
+        self._estimate_cache = {}
+        if has_codeword:
+            self._setup_representative()
+
+    def _setup_representative(self):
+        """Precompute a linear map s -> rho(s) with H rho(s) == s."""
+        H = self.H
+
+        # eliminate redundant parity-checks
+        R = list(H.T.pivots())
+        H_R = H.matrix_from_rows(R)
+
+        # select a basis for the syndrome space
+        P = list(H_R.pivots())
+        self._rep_rows = R
+        self._rep_cols = P
+        self._rep_inverse = H_R.matrix_from_columns(P).inverse()
+
+    def representative(self, s: vector) -> vector:
+        """A fixed word rho of length m with H rho == s (linear in s)."""
+        field = self.instance.field
+        rho = vector(field, [0] * self.instance.get_m())
+        if self._rep_cols:
+            values = self._rep_inverse * vector(field, [s[i] for i in self._rep_rows])
+            for j, col in enumerate(self._rep_cols):
+                rho[col] = values[j]
+        return rho
 
     def decoding_radius(self) -> int | None:
         raise NotImplementedError()
 
-    def decode(self, message: vector, l: int) -> vector:
+    def _complete_decoding_radius(self) -> int | None:
+        """
+        Returns how many errors would be returned by a "complete" decoder, that is one which (by excaustive search or similar) always decodes to the nearest codeword.
+
+        Complete decoders can use this as their decoding_radius implementation.
+        """
+        d = self.instance.get_minimum_distance()
+        if d <= 0:
+            return None
+        return (d - 1) // 2
+
+    def decode_syndrome(self, s: vector, l: int) -> vector | None:
+        """Return an error estimate for the syndrome s, or None on failure."""
         raise NotImplementedError()
 
+    def decode_codeword(self, y: vector, l: int) -> vector:
+        """Return the codeword closest to the received word y."""
+        raise NotImplementedError()
+
+    def error_estimate(self, s: vector, l: int) -> vector | None:
+        """The unique error estimate the decoder assigns to the syndrome s.
+
+        Returns ``None`` if the decoder fails on ``s``.
+        """
+        s.set_immutable()
+        if self.decodes_syndromes:
+            return self.decode_syndrome(s, l)
+
+        # if the decoder is a codeword decoder:
+        # 1. compute syndrome representative rho
+        # 2. decode rho -> c
+        # 3. report rho - c
+        key = (l, s)
+        if key not in self._estimate_cache:
+            rho = self.representative(s)
+            try:
+                codeword = self.decode_codeword(rho, l)
+            except DecodingError:
+                estimate = None
+            else:
+                estimate = rho - codeword
+                estimate.set_immutable()
+            self._estimate_cache[key] = estimate
+        return self._estimate_cache[key]
+
     def compute_benchmarks(self, l: int, n_errors: int, n_tries: int | None):
-        correct = list()
-        incorrect = list()
+        correct = []
+        incorrect = []
 
-        els = [e for e in self.instance.field if e != 0]
-        c = vector(self.instance.field, [0] * self.instance.get_m())
-        # c = vector(self.field, [0] * len(c))
+        m = self.instance.get_m()
 
-        for e in generate_errors(self.instance.field, len(c), n_errors, n_tries):
-            c_tilde = e
-            c_out = self.decode(c_tilde, l)
+        for e in generate_errors(self.instance.field, m, n_errors, n_tries):
+            s = self.H * e
+            estimate = self.error_estimate(s, l)
 
-            if c_out == c:
+            if estimate is not None and estimate == e:
                 correct.append(e)
             else:
                 incorrect.append(e)
 
-        epsilon = len(incorrect) / (len(correct) + len(incorrect))
+        n_total = len(correct) + len(incorrect)
+        if n_total == 0:
+            raise ValueError(f"No errors of weight {n_errors} exist for a code of length {m}")
+        epsilon = len(incorrect) / n_total
 
-        self.benchmarks[(n_errors, n_tries)] = BenchmarkResult(
-            correct, incorrect, epsilon
-        )
+        self.benchmarks[(l, n_errors, n_tries)] = BenchmarkResult(correct, incorrect, epsilon)
 
-    def get_benchmarks(
-        self, l: int, n_errors: int, n_tries: int | None = 100
-    ) -> BenchmarkResult:
-        key = (n_errors, n_tries)
+    def get_benchmarks(self, l: int, n_errors: int, n_tries: int | None = 100) -> BenchmarkResult:
+        key = (l, n_errors, n_tries)
         if key not in self.benchmarks:
             self.compute_benchmarks(l, n_errors, n_tries)
         return self.benchmarks[key]
@@ -120,27 +228,32 @@ class AbstractDecoder:
 
 class NearestNeighborDecoder(AbstractDecoder):
     @staticmethod
-    def constructor() -> Callable[["MaxLinSat"], AbstractDecoder]:
+    def constructor() -> Callable[[MaxLinSat], AbstractDecoder]:
         return NearestNeighborDecoder
 
-    def __init__(self, instance: "MaxLinSat"):
+    def __init__(self, instance: MaxLinSat):
         super().__init__(instance)
         self.decoder = LinearCodeNearestNeighborDecoder(instance.get_code())
 
-    def decoding_radius(self) -> int:
-        return None
+    def decoding_radius(self) -> int | None:
+        return self._complete_decoding_radius()
 
-    def decode(self, message: vector, l: int) -> vector:
-        return self.decoder.decode_to_code(message)
+    def decode_codeword(self, y: vector, l: int) -> vector:
+        return self.decoder.decode_to_code(y)
 
 
 class SyndromeDecoder(AbstractDecoder):
     @staticmethod
-    def constructor(**decoder_parameters) -> Callable[["MaxLinSat"], AbstractDecoder]:
+    def constructor(**decoder_parameters) -> Callable[[MaxLinSat], AbstractDecoder]:
         return lambda instance: SyndromeDecoder(instance, **decoder_parameters)
 
-    def __init__(self, instance: "MaxLinSat"):
+    def __init__(self, instance: MaxLinSat, **decoder_parameters):
+        super().__init__(instance)
+        # accepted for interface compatibility, LinearCodeSyndromeDecoder has no options
+        self.decoder_parameters = decoder_parameters
         self.decoders = {}
+        self.syndrome_tables = {}
+        self.syndrome_arrays = {}
 
     def get_decoder(self, l: int) -> LinearCodeSyndromeDecoder:
         valid_ls = [k for k in self.decoders if k >= l]
@@ -150,51 +263,136 @@ class SyndromeDecoder(AbstractDecoder):
 
         decoder = LinearCodeSyndromeDecoder(self.instance.get_code(), l)
         self.decoders[l] = decoder
+        # The syndrome decoder is based on code.parity_check_matrix(),
+        # which can differ from B^T.
+        # We must therefore create our own table
+        table = {}
+        for err in decoder.syndrome_table().values():
+            e = vector(self.instance.field, err)
+            e.set_immutable()
+            s = self.H * e
+            s.set_immutable()
+            table[s] = e
+        self.syndrome_tables[l] = table
         return decoder
 
-    def decoding_radius(self):
-        return None
+    def get_syndrome_table(self, l: int) -> dict:
+        valid_ls = [k for k in self.syndrome_tables if k >= l]
+        if len(valid_ls) > 0:
+            return self.syndrome_tables[min(valid_ls)]
+        self.get_decoder(l)
+        return self.syndrome_tables[l]
 
-    def decode(self, message: vector, l: int):
-        decoder = self.get_decoder(l)
-        return decoder.decode_to_code(message)
+    def get_syndrome_error_array(self, l: int) -> np.ndarray:
+        """The coset leaders of ``get_syndrome_table(l)`` as one (T, m) integer array.
+
+        The table is a map from syndrome to error, and the error determines the
+        syndrome (``s = H e``), so the errors alone carry all of it -- a consumer
+        that wants the syndromes gets them with one integer matrix product.
+
+        Converting the Sage vectors entry by entry costs O(T m) Python calls,
+        which is more than any numpy code that consumes the result, so the array
+        is built once per table and cached next to it.  Rows are in the
+        insertion order of the table.
+        """
+        table = self.get_syndrome_table(l)
+        level = min(k for k in self.syndrome_tables if k >= l)
+        if level not in self.syndrome_arrays:
+            self.syndrome_arrays[level] = self._to_array(list(table.values()))
+        return self.syndrome_arrays[level]
+
+    def _to_array(self, errors: list) -> np.ndarray:
+        """Stack error vectors into an (T, m) integer array."""
+        m = self.instance.get_m()
+        if len(errors) == 0:
+            return np.zeros((0, m), dtype=np.int64)
+        if self.instance.field.order() != 2:
+            return np.array([[int(c) for c in e] for e in errors], dtype=np.int64)
+        # Over GF(2) an error *is* its support, and support() runs inside Sage,
+        # so only the few non-zero positions of each error (at most the table's
+        # error weight) pass through Python instead of all m coordinates.  On a
+        # table of 500 000 leaders at m = 60 that is 1.3 s instead of 8 s.
+        supports = [e.support() for e in errors]
+        lengths = np.fromiter(map(len, supports), dtype=np.int64, count=len(supports))
+        array = np.zeros((len(errors), m), dtype=np.int64)
+        array[
+            np.repeat(np.arange(len(errors), dtype=np.int64), lengths),
+            np.fromiter(
+                itertools.chain.from_iterable(supports),
+                dtype=np.int64,
+                count=int(lengths.sum()),
+            ),
+        ] = 1
+        return array
+
+    def decoding_radius(self) -> int | None:
+        return self._complete_decoding_radius()
+
+    def decode_syndrome(self, s: vector, l: int) -> vector | None:
+        s.set_immutable()
+        return self.get_syndrome_table(l).get(s)
 
 
 class InformationSetDecoder(AbstractDecoder):
     @staticmethod
-    def constructor(**decoder_parameters) -> Callable[["MaxLinSat"], AbstractDecoder]:
+    def constructor(**decoder_parameters) -> Callable[[MaxLinSat], AbstractDecoder]:
         return lambda instance: InformationSetDecoder(instance, **decoder_parameters)
 
-    def __init__(self, instance: "MaxLinSat", **decoder_parameters):
+    def __init__(
+        self,
+        instance: MaxLinSat,
+        seed: int | None = 0,
+        search_size: int | None = None,
+        **decoder_parameters,
+    ):
+        """Information-set decoding (Sage's Lee-Brickell by default).
+
+        seed parameter is used for decoder's RNG.
+        A value of None results in a random seed
+
+        Set search_size to an explicit value (<= l) to make results fully reproducible, potentially at the cost of speed.
+        If search_size is None, decoder hyper-parameters are selected automatically,
+        depending on the hardware.
+        """
         super().__init__(instance)
         self.decoder_parameters = decoder_parameters
+        self.search_size = search_size
+        self._randstate = None if seed is None else randstate(seed)
         self.decoders = {}
 
     def get_decoder(self, l: int) -> LinearCodeInformationSetDecoder:
         if l not in self.decoders:
+            parameters = dict(self.decoder_parameters)
+            if self.search_size is not None:
+                # Sage accepts algorithm parameters only when explicitly selecting an algorithm
+                parameters.setdefault("algorithm", "Lee-Brickell")
+                parameters["search_size"] = min(self.search_size, l)
             self.decoders[l] = LinearCodeInformationSetDecoder(
-                self.instance.get_code(), l, **self.decoder_parameters
+                self.instance.get_code(), l, **parameters
             )
         return self.decoders[l]
 
     def decoding_radius(self):
         return None
 
-    def decode(self, message: vector, l: int):
-        decoder = self.get_decoder(l)
-        return decoder.decode_to_code(message)
+    def decode_codeword(self, y: vector, l: int) -> vector:
+        if self._randstate is None:
+            return self.get_decoder(l).decode_to_code(y)
+        with self._randstate:
+            return self.get_decoder(l).decode_to_code(y)
 
 
 class BeliefPropagationDecoder(AbstractDecoder):
     @staticmethod
-    def constructor(**decoder_parameters) -> Callable[["MaxLinSat"], AbstractDecoder]:
+    def constructor(**decoder_parameters) -> Callable[[MaxLinSat], AbstractDecoder]:
         return lambda instance: BeliefPropagationDecoder(instance, **decoder_parameters)
 
-    def __init__(self, instance: "MaxLinSat", **decoder_parameters):
+    def __init__(self, instance: MaxLinSat, **decoder_parameters):
         super().__init__(instance)
-        self.H = sp.sparse.csc_matrix(
-            np.array(self.instance.get_code().parity_check_matrix()).astype(np.int8)
-        )
+        # the ldpc decoder must use the same parity check matrix (and hence the
+        # same syndrome basis) as the framework: H = B^T
+        H = np.array(self.H.list(), dtype=np.int8).reshape(self.H.nrows(), self.H.ncols())
+        self.H_sparse = sp.sparse.csc_matrix(H)
         self.decoder_parameters = decoder_parameters
         self.decoders = {}
 
@@ -204,33 +402,30 @@ class BeliefPropagationDecoder(AbstractDecoder):
     def get_decoder(self, l: int) -> BpDecoder:
         if l not in self.decoders:
             error_rate = l / self.instance.get_m()
-            self.decoders[l] = BpDecoder(
-                self.H, error_rate=error_rate, **self.decoder_parameters
-            )
+            parameters = dict(self.decoder_parameters)
+            parameters["input_vector_type"] = "syndrome"
+            self.decoders[l] = BpDecoder(self.H_sparse, error_rate=error_rate, **parameters)
         return self.decoders[l]
 
-    def decode(self, message: vector, l: int) -> vector:
-        message_np = np.array(message)
+    def decode_syndrome(self, s: vector, l: int) -> vector:
+        syndrome_np = np.array([int(x) for x in s], dtype=np.uint8)
         decoder = self.get_decoder(l)
-        result_np = decoder.decode(message_np)
+        result_np = decoder.decode(syndrome_np)
         return vector(self.instance.field, result_np)
 
 
 class BeliefPropagationOsdDecoder(AbstractDecoder):
     @staticmethod
-    def constructor(**decoder_parameters) -> Callable[["MaxLinSat"], AbstractDecoder]:
-        return lambda instance: BeliefPropagationOsdDecoder(
-            instance, **decoder_parameters
-        )
+    def constructor(**decoder_parameters) -> Callable[[MaxLinSat], AbstractDecoder]:
+        return lambda instance: BeliefPropagationOsdDecoder(instance, **decoder_parameters)
 
     def decoding_radius(self) -> None:
         return None
 
-    def __init__(self, instance: "MaxLinSat", **decoder_parameters):
+    def __init__(self, instance: MaxLinSat, **decoder_parameters):
         super().__init__(instance)
-        self.H = sp.sparse.csc_matrix(
-            np.array(self.instance.get_code().parity_check_matrix()).astype(np.int8)
-        )
+        H = np.array(self.H.list(), dtype=np.int8).reshape(self.H.nrows(), self.H.ncols())
+        self.H_sparse = sp.sparse.csc_matrix(H)
         self.decoder_parameters = decoder_parameters
         self.decoders = {}
 
@@ -238,47 +433,65 @@ class BeliefPropagationOsdDecoder(AbstractDecoder):
         if l not in self.decoders:
             error_rate = l / self.instance.get_m()
             self.decoders[l] = BpOsdDecoder(
-                self.H, error_rate=error_rate, **self.decoder_parameters
+                self.H_sparse, error_rate=error_rate, **self.decoder_parameters
             )
         return self.decoders[l]
 
-    def decode(self, message, l):
-        message_np = np.array(message, dtype=np.int8)
-        syndrome = self.H @ message_np % 2
+    def decode_syndrome(self, s: vector, l: int) -> vector:
+        syndrome_np = np.array([int(x) for x in s], dtype=np.uint8)
         decoder = self.get_decoder(l)
-        result_np = decoder.decode(syndrome)
-        decoded = message_np + result_np
-        return vector(self.instance.field, decoded)
+        result_np = decoder.decode(syndrome_np)
+        return vector(self.instance.field, result_np)
 
 
 class GeneralizedReedSolomonDecoder(AbstractDecoder):
     @staticmethod
-    def constructor() -> Callable[["MaxLinSat"], AbstractDecoder]:
+    def constructor() -> Callable[[MaxLinSat], AbstractDecoder]:
         return GeneralizedReedSolomonDecoder
 
-    def __init__(self, instance: "MaxLinSat"):
+    def __init__(self, instance: MaxLinSat):
         super().__init__(instance)
-        self.decoder = GRSBerlekampWelchDecoder(self.instance.code)
+        code = self.instance.get_code()
+        if not isinstance(code, GeneralizedReedSolomonCode):
+            raise TypeError(
+                f"GeneralizedReedSolomonDecoder needs a GRS code, got {type(code).__name__}"
+            )
+        self.code = code
+        self.decoder = GRSBerlekampWelchDecoder(code)
         self.list_decoders = {}
 
-    def get_decoder_by_l(
-        self, l: int
-    ) -> GRSBerlekampWelchDecoder | GRSGuruswamiSudanDecoder:
-        if l <= self.decoding_radius():
+    def get_decoder_by_l(self, l: int) -> GRSBerlekampWelchDecoder | GRSGuruswamiSudanDecoder:
+        radius = self.decoding_radius()
+        if l <= radius:
             return self.decoder
-        if l in self.list_decoders:
-            return self.list_decoders[l]
-        decoder = GRSGuruswamiSudanDecoder(self.instance.code, l)
-        self.list_decoders[l] = decoder
-        return decoder
+        if l not in self.list_decoders:
+            # use unique decoder as fallback
+            decoder = self.decoder
+            for tau in range(l, radius, -1):
+                # Using a decoding radius beyond the theoretical list-decoding limit (Johnson bound) fails
+                try:
+                    decoder = GRSGuruswamiSudanDecoder(self.code, tau)
+                    break
+                except ValueError:
+                    continue
+            self.list_decoders[l] = decoder
+        return self.list_decoders[l]
 
     def decoding_radius(self) -> int:
         return (self.instance.get_minimum_distance() - 1) // 2
 
-    def decode(self, message: vector, l: int) -> vector:
-        result = self.get_decoder_by_l(l).decode_to_code(message)
+    def decode_codeword(self, y: vector, l: int) -> vector:
+        try:
+            result = self.get_decoder_by_l(l).decode_to_code(y)
+        except ValueError as ex:
+            # Workaround for a (potential) Sage bug:
+            # The Berlekamp-Welch decoder can raise a ValueError instead of a DecodingError when given a word beyond its radius
+            raise DecodingError(str(ex)) from ex
         if isinstance(result, list):
-            return result[0]
+            # The list decoder producing an empty list is a decoding error
+            if len(result) == 0:
+                raise DecodingError("list decoding returned no codeword")
+            return min(result, key=lambda c: (y - c).hamming_weight())
         return result
 
 
